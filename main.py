@@ -1,9 +1,7 @@
 import json
 import os
-from copy import deepcopy
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
 from math import isfinite
 from urllib.error import URLError
 from urllib.parse import urlencode
@@ -15,9 +13,6 @@ import streamlit as st
 
 INITIAL_CAPITAL = 100000
 STOCKS = {"AAPL": "Apple", "MSFT": "Microsoft", "NVDA": "NVIDIA", "AMZN": "Amazon", "GOOGL": "Alphabet"}
-DEFAULT_SAVE_FILE = Path(__file__).with_name("portfolio.json")
-SAVE_FILE = Path(os.environ.get("SIMULATOR_SAVE_FILE", DEFAULT_SAVE_FILE))
-LEGACY_SIDES = {"买入": "Buy", "卖出": "Sell"}
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -41,11 +36,16 @@ def fetch_daily(symbol, api_key):
     if "Error Message" in payload or not payload.get("Time Series (Daily)"):
         raise ValueError("The API returned no daily prices for this stock.")
     try:
-        frame = pd.DataFrame.from_dict(payload["Time Series (Daily)"], orient="index")
+        series = payload["Time Series (Daily)"]
+        if not isinstance(series, dict) or not all(isinstance(row, dict) for row in series.values()):
+            raise ValueError
+        frame = pd.DataFrame.from_dict(series, orient="index")
         frame = frame[["4. close"]]
         frame = frame.rename(columns={"4. close": "Close"})
         frame = frame.astype(float)
         frame.index = pd.to_datetime(frame.index)
+        if frame.index.hasnans:
+            raise ValueError
         frame = frame.sort_index()
         frame = frame.tail(100)
         if frame.empty:
@@ -62,8 +62,10 @@ def quote_on_date(frame, selected_date):
     day = pd.Timestamp(selected_date)
     if day not in frame.index:
         if day < frame.index.min():
-            raise ValueError("The selected date is earlier than the latest 100 trading days.")
-        raise ValueError("No data for this date. The market may be closed or daily prices are not yet available.")
+            raise ValueError(f"The selected date is too old. Available prices start on {frame.index.min():%Y-%m-%d} (compact data: up to 100 trading days).")
+        if day.dayofweek >= 5:
+            raise ValueError("The selected date is a weekend. US stock markets are closed; choose a trading date.")
+        raise ValueError("No closing price for this date. The market may be closed for a holiday or daily prices are not yet available. Choose another date.")
     price = frame.loc[day, "Close"]
     earlier_dates = frame.index < day
     previous = frame.loc[earlier_dates, "Close"]
@@ -78,49 +80,6 @@ def new_portfolio():
     return {"cash": Decimal(str(INITIAL_CAPITAL)), "holdings": {}, "history": []}
 
 
-def save_portfolio(portfolio, selected_date):
-    data = {"history": portfolio["history"], "selected_date": selected_date}
-    temporary = SAVE_FILE.with_suffix(".tmp")
-    try:
-        text = json.dumps(data, default=str, ensure_ascii=False, indent=2)
-        temporary.write_text(text, encoding="utf-8")
-        temporary.replace(SAVE_FILE)
-    except OSError:
-        raise ValueError("Save failed. Check folder permissions. This operation was not applied.") from None
-
-
-def load_portfolio():
-    portfolio = new_portfolio()
-    try:
-        text = SAVE_FILE.read_text(encoding="utf-8")
-        data = json.loads(text)
-        if not isinstance(data, dict) or not isinstance(data.get("history"), list):
-            raise ValueError
-        selected = None
-        if data["selected_date"]:
-            selected = date.fromisoformat(data["selected_date"])
-        for trade in data["history"]:
-            trade_stock(portfolio, trade["symbol"], trade["shares"], trade["price"],
-                        date.fromisoformat(trade["date"]), trade["side"])
-        if portfolio["history"]:
-            last_trade_date = portfolio["history"][-1]["date"]
-            if selected is None or selected < last_trade_date:
-                raise ValueError
-        return portfolio, selected
-    except FileNotFoundError:
-        return portfolio, None
-    except (OSError, ValueError, KeyError, TypeError, InvalidOperation):
-        raise ValueError("Could not read portfolio.json. Check the file or back it up and move it before restarting. The original file was not overwritten.") from None
-
-
-def saved_trade(portfolio, symbol, shares, price, selected_date, side):
-    updated = deepcopy(portfolio)
-    amount = trade_stock(updated, symbol, shares, price, selected_date, side)
-    save_portfolio(updated, selected_date)
-    portfolio.update(updated)
-    return amount
-
-
 def sellable_shares(portfolio, symbol, trade_date):
     available = 0
     for trade in portfolio["history"]:
@@ -133,8 +92,10 @@ def sellable_shares(portfolio, symbol, trade_date):
 
 
 def trade_stock(portfolio, symbol, shares, price, trade_date, side):
-    price = Decimal(str(price))
-    side = LEGACY_SIDES.get(side, side)
+    try:
+        price = Decimal(str(price))
+    except InvalidOperation:
+        raise ValueError("The current price is invalid. Trading is unavailable.") from None
     if side not in ("Buy", "Sell"):
         raise ValueError("Choose Buy or Sell.")
     if symbol not in STOCKS:
@@ -263,12 +224,13 @@ def show_market(api_key, selected_date, portfolio):
     symbol = st.selectbox("Select a stock", list(histories))
     st.subheader("Simulated Trading")
     st.write(f"Stock: {STOCKS[symbol]} ({symbol}) | Trade price: {prices[symbol]:.4f} USD")
+    holding_summary = st.empty()
     with st.form("buy_form", clear_on_submit=True):
         shares = st.number_input("Shares to buy", min_value=1, value=1, step=1)
         buy = st.form_submit_button("Buy")
     if buy:
         try:
-            cost = saved_trade(portfolio, symbol, shares, prices[symbol], selected_date, "Buy")
+            cost = trade_stock(portfolio, symbol, shares, prices[symbol], selected_date, "Buy")
             st.success(f"Bought {shares} shares of {symbol} for {cost:,.2f} USD.")
         except ValueError as error:
             st.error(str(error))
@@ -278,17 +240,32 @@ def show_market(api_key, selected_date, portfolio):
         sell = st.form_submit_button("Sell", disabled=available == 0)
     if sell:
         try:
-            amount = saved_trade(portfolio, symbol, sell_shares, prices[symbol], selected_date, "Sell")
+            amount = trade_stock(portfolio, symbol, sell_shares, prices[symbol], selected_date, "Sell")
             st.success(f"Sold {sell_shares} shares of {symbol} for {amount:,.2f} USD.")
         except ValueError as error:
             st.error(str(error))
+    holding_summary.metric(f"Shares Held ({symbol})", portfolio["holdings"].get(symbol, 0))
     available = sellable_shares(portfolio, symbol, selected_date)
     st.caption(f"Sellable shares: {available}. Shares can only be sold after their purchase date.")
     st.caption("Trades use the selected date's closing price with no fees. Total assets = cash + holdings value.")
     st.subheader(f"{STOCKS[symbol]} ({symbol}) - Closing Prices")
     st.line_chart(histories[symbol], x_label="Trading Date", y_label="Close (USD)")
     st.caption("Shows available prices up to the selected date within the latest 100 trading days. Prices are unadjusted for splits and dividends.")
+    st.subheader("Market Analytics")
+    volatility, drawdown = market_analytics(histories[symbol])
+    metrics = st.columns(2)
+    metrics[0].metric("Annualized Volatility", "Unavailable" if volatility is None else f"{volatility:.2%}")
+    metrics[1].metric("Maximum Drawdown", f"{drawdown:.2%}")
+    st.caption("Uses the chart's closing prices up to the selected date. Volatility assumes 252 trading days per year and needs at least two daily returns. Drawdown is shown as a positive peak-to-trough loss.")
     return prices
+
+
+def market_analytics(frame):
+    close = frame["Close"]
+    returns = close.pct_change().dropna()
+    volatility = float(returns.std() * 252 ** 0.5) if len(returns) >= 2 else None
+    drawdown = float((1 - close / close.cummax()).max())
+    return volatility, drawdown
 
 
 def main():
@@ -297,58 +274,16 @@ def main():
     st.subheader("My Portfolio")
     st.metric("Initial Capital (USD)", f"${INITIAL_CAPITAL:,.2f}")
     if "portfolio" not in st.session_state:
-        try:
-            portfolio, selected = load_portfolio()
-        except ValueError as error:
-            st.error(str(error))
-            return
-        st.session_state.portfolio = portfolio
-        if selected is not None:
-            st.session_state.selected_date = selected
-            st.session_state.date_choice = selected
-    st.caption("Reset restores 100,000 USD and clears holdings, trade history and the saved simulation date.")
+        st.session_state.portfolio = new_portfolio()
+    st.caption("Each session has its own portfolio. Reset restores 100,000 USD and clears this session's holdings, trade history and simulation date.")
     if st.button("Reset Simulation"):
-        try:
-            save_portfolio(new_portfolio(), None)
-            st.session_state.portfolio = new_portfolio()
-            for key in ("selected_date", "date_choice"):
-                st.session_state.pop(key, None)
-        except ValueError as error:
-            st.error(str(error))
+        st.session_state.portfolio = new_portfolio()
+        for key in ("selected_date", "date_choice"):
+            st.session_state.pop(key, None)
     portfolio = st.session_state.portfolio
-    if "history" not in portfolio:
-        st.warning("This older session has no trade dates. Reset the simulation to continue.")
-        return
-    for trade in portfolio["history"]:
-        trade["side"] = LEGACY_SIDES.get(trade["side"], trade["side"])
     summary = st.container()
-    st.caption("Trades and date changes are saved locally to portfolio.json and restored on startup. Use only one browser tab.")
     st.subheader("Market Overview")
     st.caption("Historical US stock prices from Alpha Vantage | Latest 100 trading days | Change from the previous trading day")
-
-    if "date_choice" not in st.session_state:
-        st.session_state.date_choice = date.today()
-    with st.form("date_form"):
-        chosen = st.date_input("Market Date", value=None, key="date_choice",
-                               min_value=date(1999, 1, 1), max_value=date.today())
-        submitted = st.form_submit_button("Load Prices")
-    if submitted and chosen is None:
-        st.error("Please choose a market date first.")
-    elif submitted:
-        if portfolio["history"] and chosen < st.session_state.selected_date:
-            st.error("You cannot move backwards after trading. The previous simulation date is still active.")
-        else:
-            try:
-                save_portfolio(portfolio, chosen)
-                st.session_state.selected_date = chosen
-            except ValueError as error:
-                st.error(str(error))
-    if "selected_date" not in st.session_state:
-        with summary:
-            show_portfolio(portfolio, {})
-        show_history(portfolio)
-        st.info("Choose a date and click Load Prices. Closed market dates are not replaced with other dates.")
-        return
 
     api_key = os.environ.get("ALPHA_VANTAGE_API_KEY", "")
     if not api_key:
@@ -357,11 +292,47 @@ def main():
         except FileNotFoundError:
             pass
     if not api_key:
-        st.error("Set ALPHA_VANTAGE_API_KEY in .streamlit/secrets.toml.")
+        st.error("Set ALPHA_VANTAGE_API_KEY in .streamlit/secrets.toml or as an environment variable.")
         with summary:
             show_portfolio(portfolio, {})
         show_history(portfolio)
         return
+    reference = None
+    for reference_symbol in STOCKS:
+        try:
+            reference, _ = fetch_daily(reference_symbol, api_key)
+            break
+        except ValueError as error:
+            st.warning(f"{reference_symbol}: {error}")
+    if reference is None:
+        with summary:
+            show_portfolio(portfolio, {})
+        show_history(portfolio)
+        return
+    earliest = reference.index.min().date()
+    latest = reference.index.max().date()
+    st.caption(f"Available {reference_symbol} prices: {earliest:%Y-%m-%d} to {latest:%Y-%m-%d}. Older dates are unavailable in compact mode. Weekends and missing dates are never replaced automatically.")
+
+    if "date_choice" not in st.session_state:
+        st.session_state.date_choice = date.today()
+    with st.form("date_form"):
+        chosen = st.date_input("Market Date", value=None, key="date_choice",
+                               min_value=earliest, max_value=date.today())
+        submitted = st.form_submit_button("Load Prices")
+    if submitted and chosen is None:
+        st.error(f"Choose a market date on or after {earliest:%Y-%m-%d}. Older dates are unavailable in compact mode.")
+    elif submitted:
+        if portfolio["history"] and chosen < st.session_state.selected_date:
+            st.error("You cannot move backwards after trading. The previous simulation date is still active.")
+        else:
+            st.session_state.selected_date = chosen
+    if "selected_date" not in st.session_state:
+        with summary:
+            show_portfolio(portfolio, {})
+        show_history(portfolio)
+        st.info("Choose a date and click Load Prices. Closed market dates are not replaced with other dates.")
+        return
+
     prices = show_market(api_key, st.session_state.selected_date, portfolio)
     with summary:
         st.caption(f"Valuation Date: {st.session_state.selected_date}")
