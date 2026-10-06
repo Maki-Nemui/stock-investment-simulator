@@ -225,9 +225,11 @@ def show_market(api_key, selected_date, portfolio):
     st.subheader("Simulated Trading")
     st.write(f"Stock: {STOCKS[symbol]} ({symbol}) | Trade price: {prices[symbol]:.4f} USD")
     holding_summary = st.empty()
-    with st.form("buy_form", clear_on_submit=True):
-        shares = st.number_input("Shares to buy", min_value=1, value=1, step=1)
-        buy = st.form_submit_button("Buy")
+    cash_summary = st.empty()
+    trade_price = Decimal(str(prices[symbol]))
+    shares = st.number_input("Shares to buy", min_value=1, value=1, step=1)
+    st.metric("Buy Total (USD)", f"${trade_price * shares:,.2f}")
+    buy = st.button("Buy")
     if buy:
         try:
             cost = trade_stock(portfolio, symbol, shares, prices[symbol], selected_date, "Buy")
@@ -235,9 +237,9 @@ def show_market(api_key, selected_date, portfolio):
         except ValueError as error:
             st.error(str(error))
     available = sellable_shares(portfolio, symbol, selected_date)
-    with st.form("sell_form", clear_on_submit=True):
-        sell_shares = st.number_input("Shares to sell", min_value=1, value=1, step=1)
-        sell = st.form_submit_button("Sell", disabled=available == 0)
+    sell_shares = st.number_input("Shares to sell", min_value=1, value=1, step=1)
+    st.metric("Sell Proceeds (USD)", f"${trade_price * sell_shares:,.2f}")
+    sell = st.button("Sell", disabled=available == 0)
     if sell:
         try:
             amount = trade_stock(portfolio, symbol, sell_shares, prices[symbol], selected_date, "Sell")
@@ -245,6 +247,7 @@ def show_market(api_key, selected_date, portfolio):
         except ValueError as error:
             st.error(str(error))
     holding_summary.metric(f"Shares Held ({symbol})", portfolio["holdings"].get(symbol, 0))
+    cash_summary.metric("Available Cash (USD)", f'${portfolio["cash"]:,.2f}')
     available = sellable_shares(portfolio, symbol, selected_date)
     st.caption(f"Sellable shares: {available}. Shares can only be sold after their purchase date.")
     st.caption("Trades use the selected date's closing price with no fees. Total assets = cash + holdings value.")
