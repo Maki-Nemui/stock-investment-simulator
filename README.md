@@ -1,7 +1,7 @@
 # Stock Portfolio Simulator
 
 A small Python and Streamlit project for learning historical stock trading simulation.
-Requires Python 3.10 or newer. The interface is in English; source comments remain in Chinese for learning.
+Requires Python 3.10 or newer. 
 
 ## Run
 
